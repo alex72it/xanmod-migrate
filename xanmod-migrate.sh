@@ -108,19 +108,58 @@ c "CPU psABI: v$LVL  ->  пакет $PKG"
 AVAIL=$(df -Pm / | awk 'NR==2{print $4}')
 [ "$AVAIL" -ge 1500 ] || die "мало места на / ($AVAIL MB, нужно >=1500)"
 
+have_cmd(){ command -v "$1" >/dev/null 2>&1; }
+fetch_url_to_stdout(){
+  if have_cmd curl; then curl -fsSL "$1" && return 0; fi
+  if have_cmd wget; then wget -qO - "$1" && return 0; fi
+  return 1
+}
+install_xanmod_key(){
+  local key_url tmpasc tmpgpg src
+  tmpasc=$(mktemp) || return 1
+  tmpgpg=$(mktemp) || { rm -f "$tmpasc"; return 1; }
+  for key_url in \
+    "https://dl.xanmod.org/archive.key" \
+    "https://dl.xanmod.org/gpg.key" \
+    "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x86F7D09EE734E623"
+  do
+    if fetch_url_to_stdout "$key_url" >"$tmpasc" 2>/dev/null \
+       && grep -q 'BEGIN PGP PUBLIC KEY BLOCK' "$tmpasc" 2>/dev/null \
+       && gpg --dearmor <"$tmpasc" >"$tmpgpg" 2>/dev/null \
+       && [ -s "$tmpgpg" ]; then
+      install -m 0644 "$tmpgpg" /etc/apt/keyrings/xanmod-archive-keyring.gpg
+      src="${key_url#https://}"
+      ok "Ключ XanMod установлен: $src"
+      rm -f "$tmpasc" "$tmpgpg"
+      return 0
+    fi
+  done
+  rm -f "$tmpasc" "$tmpgpg"
+  return 1
+}
+xanmod_key_error(){
+  grep -qiE 'NO_PUBKEY 86F7D09EE734E623|signatures couldn.t be verified|repository .+deb.xanmod.org.+ is not signed' /tmp/xm_aptupdate.log 2>/dev/null
+}
+
 # ====================================================================
 # 3. РЕПОЗИТОРИЙ XANMOD + УСТАНОВКА
 # ====================================================================
 c ">>> Подключаю репозиторий XanMod…"
 install -d /etc/apt/keyrings
-if [ ! -f /etc/apt/keyrings/xanmod-archive-keyring.gpg ]; then
-  ( wget -qO - https://dl.xanmod.org/archive.key || curl -fsSL https://dl.xanmod.org/archive.key ) \
-    | gpg --dearmor -o /etc/apt/keyrings/xanmod-archive-keyring.gpg || die "не скачался ключ XanMod"
+if [ ! -s /etc/apt/keyrings/xanmod-archive-keyring.gpg ]; then
+  c "Устанавливаю ключ подписи XanMod…"
+  install_xanmod_key || die "не скачался ключ XanMod (проверь доступ к dl.xanmod.org / keyserver.ubuntu.com)"
 fi
 echo "deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org $CN main" \
   > /etc/apt/sources.list.d/xanmod-release.list
 c "Обновляю списки пакетов…"
 apt-get update -o Acquire::Retries=3 2>/tmp/xm_aptupdate.log >/dev/null || true
+if xanmod_key_error; then
+  warn "APT отклонил подпись XanMod — переустанавливаю ключ и повторяю update…"
+  install_xanmod_key || die "не удалось импортировать ключ XanMod автоматически"
+  rm -f /var/lib/apt/lists/deb.xanmod.org_* 2>/dev/null || true
+  apt-get update -o Acquire::Retries=3 -o Acquire::Check-Valid-Until=false 2>/tmp/xm_aptupdate.log >/dev/null || true
+fi
 CAND=$(LC_ALL=C apt-cache policy "$PKG" 2>/dev/null | awk '/Candidate:/{print $2}')
 if [ -z "$CAND" ] || [ "$CAND" = "(none)" ]; then
   warn "Кандидат не найден с первого раза — принудительно перечитываю список XanMod…"
@@ -130,6 +169,10 @@ if [ -z "$CAND" ] || [ "$CAND" = "(none)" ]; then
 fi
 if [ -z "$CAND" ] || [ "$CAND" = "(none)" ]; then
   err "Нет кандидата для $PKG (codename=$CN)."
+  if xanmod_key_error; then
+    err "Похоже, ключ подписи XanMod не удалось получить автоматически."
+    err "Проверь доступ к keyserver.ubuntu.com и GitLab-редиректу dl.xanmod.org."
+  fi
   if grep -qiE 'xanmod' /tmp/xm_aptupdate.log 2>/dev/null; then
     err "Сервер НЕ смог скачать список пакетов с deb.xanmod.org. Ошибки apt:"
     grep -i xanmod /tmp/xm_aptupdate.log | tail -4 >&2
