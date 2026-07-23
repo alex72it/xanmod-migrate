@@ -28,6 +28,7 @@ ok(){ printf '\033[1;32m%s\033[0m\n' "$*"; }     # success
 warn(){ printf '\033[1;33m%s\033[0m\n' "$*"; }   # warn
 err(){ printf '\033[1;31m%s\033[0m\n' "$*" >&2; } # error
 die(){ err "ОШИБКА: $*"; exit 1; }
+have_cmd(){ command -v "$1" >/dev/null 2>&1; }
 
 [ "$(id -u)" = "0" ] || die "запускать нужно от root (sudo -i, затем bash $0)"
 
@@ -54,8 +55,17 @@ apply_tuning(){
   else CTMAX=1048576; fi
   if [ "$RAM" -ge 8000 ]; then BUF=67108864; else BUF=16777216; fi
   SOMAX=16384; BACKLOG=16384
+  # nf_conntrack может быть модулем и ещё не быть загружен на минимальном образе.
+  # Не пишем в отсутствующий /proc/sys: bash печатает ошибку редиректа даже при
+  # `2>/dev/null`, а sysctl.d затем шумит при каждой загрузке.
+  have_cmd modprobe && modprobe nf_conntrack >/dev/null 2>&1 || true
+  CT_AVAILABLE=0
+  if [ -r /proc/sys/net/netfilter/nf_conntrack_max ]; then
+    CT_AVAILABLE=1
+    cur=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo 0)
+    [ "${cur:-0}" -gt "$CTMAX" ] && CTMAX=$cur
+  fi
   # не понижаем уже бОльшие значения
-  cur=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo 0); [ "${cur:-0}" -gt "$CTMAX" ] && CTMAX=$cur
   cur=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0);     [ "${cur:-0}" -gt "$BUF" ] && BUF=$cur
   cur=$(sysctl -n net.core.somaxconn 2>/dev/null || echo 0);    [ "${cur:-0}" -gt "$SOMAX" ] && SOMAX=$cur
   cur=$(sysctl -n net.core.netdev_max_backlog 2>/dev/null || echo 0); [ "${cur:-0}" -gt "$BACKLOG" ] && BACKLOG=$cur
@@ -76,12 +86,23 @@ net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_tw_reuse = 1
-net.netfilter.nf_conntrack_max = $CTMAX
 EOF
-  echo "options nf_conntrack hashsize=$HASH" > /etc/modprobe.d/nf_conntrack.conf
+  if [ "$CT_AVAILABLE" = "1" ]; then
+    echo "net.netfilter.nf_conntrack_max = $CTMAX" >> /etc/sysctl.d/99-vpn-tuning.conf
+    echo "options nf_conntrack hashsize=$HASH" > /etc/modprobe.d/nf_conntrack.conf
+    install -d /etc/modules-load.d
+    echo "nf_conntrack" > /etc/modules-load.d/xanmod-migrate.conf
+  else
+    warn "nf_conntrack недоступен в текущем ядре — его параметры пропущены"
+  fi
   sysctl --system >/dev/null 2>&1 || true
-  echo "$CTMAX" > /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || true
-  ok "Тюнинг применён: buffers=$BUF, somaxconn=$SOMAX, conntrack_max=$CTMAX (RAM ${RAM}MB)"
+  if [ "$CT_AVAILABLE" = "1" ] && [ -w /proc/sys/net/netfilter/nf_conntrack_max ]; then
+    printf '%s\n' "$CTMAX" > /proc/sys/net/netfilter/nf_conntrack_max
+    CT_STATUS=$CTMAX
+  else
+    CT_STATUS="пропущен"
+  fi
+  ok "Тюнинг применён: buffers=$BUF, somaxconn=$SOMAX, conntrack_max=$CT_STATUS (RAM ${RAM}MB)"
 }
 
 apply_tuning
@@ -108,11 +129,33 @@ c "CPU psABI: v$LVL  ->  пакет $PKG"
 AVAIL=$(df -Pm / | awk 'NR==2{print $4}')
 [ "$AVAIL" -ge 1500 ] || die "мало места на / ($AVAIL MB, нужно >=1500)"
 
-have_cmd(){ command -v "$1" >/dev/null 2>&1; }
 fetch_url_to_stdout(){
   if have_cmd curl; then curl -fsSL "$1" && return 0; fi
   if have_cmd wget; then wget -qO - "$1" && return 0; fi
   return 1
+}
+xanmod_suite_available(){
+  local suite="$1" tmp
+  tmp=$(mktemp) || return 1
+  if fetch_url_to_stdout "https://deb.xanmod.org/dists/${suite}/InRelease" >"$tmp" 2>/dev/null \
+     && grep -q '^-----BEGIN PGP SIGNED MESSAGE-----' "$tmp" \
+     && grep -qE "^(Suite|Codename):[[:space:]]*${suite}$" "$tmp"; then
+    rm -f "$tmp"
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+remove_stale_xanmod_source(){
+  local source_file=/etc/apt/sources.list.d/xanmod-release.list backup_dir backup_file
+  if [ -f "$source_file" ] \
+     && grep -qE '^[[:space:]]*deb([[:space:]]+\[[^]]+\])?[[:space:]]+https?://deb\.xanmod\.org([[:space:]]|/)' "$source_file"; then
+    backup_dir=/var/backups/xanmod-migrate
+    backup_file="$backup_dir/xanmod-release.list.$(date +%Y%m%d_%H%M%S)"
+    install -d -m 0700 "$backup_dir"
+    mv "$source_file" "$backup_file"
+    warn "Нерабочий источник XanMod отключён (резервная копия: $backup_file)"
+  fi
 }
 install_xanmod_key(){
   local key_url tmpasc tmpgpg src
@@ -138,33 +181,48 @@ install_xanmod_key(){
   return 1
 }
 xanmod_key_error(){
-  grep -qiE 'NO_PUBKEY 86F7D09EE734E623|signatures couldn.t be verified|repository .+deb.xanmod.org.+ is not signed' /tmp/xm_aptupdate.log 2>/dev/null
+  grep -qiE 'NO_PUBKEY 86F7D09EE734E623|signatures couldn.t be verified|repository .+deb.xanmod.org.+ is not signed' "$APT_LOG" 2>/dev/null
 }
 
 # ====================================================================
 # 3. РЕПОЗИТОРИЙ XANMOD + УСТАНОВКА
 # ====================================================================
 c ">>> Подключаю репозиторий XanMod…"
+if ! xanmod_suite_available "$CN"; then
+  remove_stale_xanmod_source
+  err "XanMod не публикует репозиторий для codename '$CN' (проверен официальный InRelease)."
+  if [ "${ID:-}" = "ubuntu" ] && [ "$CN" = "jammy" ]; then
+    err "Ubuntu 22.04 (jammy) больше не поддерживается репозиторием XanMod."
+    err "Обнови ОС до поддерживаемого Ubuntu LTS (сейчас 24.04 noble), затем запусти скрипт снова."
+  else
+    err "Поддерживаемые системы указаны на https://xanmod.org/ в разделе APT Repository."
+  fi
+  die "APT не изменён; подключать репозиторий от другой версии ОС небезопасно"
+fi
 install -d /etc/apt/keyrings
 if [ ! -s /etc/apt/keyrings/xanmod-archive-keyring.gpg ]; then
   c "Устанавливаю ключ подписи XanMod…"
   install_xanmod_key || die "не скачался ключ XanMod (проверь доступ к dl.xanmod.org / keyserver.ubuntu.com)"
 fi
-echo "deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org $CN main" \
+echo "deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] https://deb.xanmod.org $CN main" \
   > /etc/apt/sources.list.d/xanmod-release.list
 c "Обновляю списки пакетов…"
-apt-get update -o Acquire::Retries=3 2>/tmp/xm_aptupdate.log >/dev/null || true
+APT_LOG=$(mktemp) || die "не удалось создать временный лог apt"
+trap 'rm -f "$APT_LOG"' EXIT
+apt-get update -o Acquire::Retries=3 2>"$APT_LOG" >/dev/null || true
 if xanmod_key_error; then
   warn "APT отклонил подпись XanMod — переустанавливаю ключ и повторяю update…"
   install_xanmod_key || die "не удалось импортировать ключ XanMod автоматически"
   rm -f /var/lib/apt/lists/deb.xanmod.org_* 2>/dev/null || true
-  apt-get update -o Acquire::Retries=3 -o Acquire::Check-Valid-Until=false 2>/tmp/xm_aptupdate.log >/dev/null || true
+  : >"$APT_LOG"
+  apt-get update -o Acquire::Retries=3 -o Acquire::Check-Valid-Until=false 2>"$APT_LOG" >/dev/null || true
 fi
 CAND=$(LC_ALL=C apt-cache policy "$PKG" 2>/dev/null | awk '/Candidate:/{print $2}')
 if [ -z "$CAND" ] || [ "$CAND" = "(none)" ]; then
   warn "Кандидат не найден с первого раза — принудительно перечитываю список XanMod…"
   rm -f /var/lib/apt/lists/deb.xanmod.org_* 2>/dev/null || true
-  apt-get update -o Acquire::Retries=3 -o Acquire::Check-Valid-Until=false 2>>/tmp/xm_aptupdate.log >/dev/null || true
+  : >"$APT_LOG"
+  apt-get update -o Acquire::Retries=3 -o Acquire::Check-Valid-Until=false 2>"$APT_LOG" >/dev/null || true
   CAND=$(LC_ALL=C apt-cache policy "$PKG" 2>/dev/null | awk '/Candidate:/{print $2}')
 fi
 if [ -z "$CAND" ] || [ "$CAND" = "(none)" ]; then
@@ -173,12 +231,12 @@ if [ -z "$CAND" ] || [ "$CAND" = "(none)" ]; then
     err "Похоже, ключ подписи XanMod не удалось получить автоматически."
     err "Проверь доступ к keyserver.ubuntu.com и GitLab-редиректу dl.xanmod.org."
   fi
-  if grep -qiE 'xanmod' /tmp/xm_aptupdate.log 2>/dev/null; then
+  if grep -qiE 'xanmod' "$APT_LOG" 2>/dev/null; then
     err "Сервер НЕ смог скачать список пакетов с deb.xanmod.org. Ошибки apt:"
-    grep -i xanmod /tmp/xm_aptupdate.log | tail -4 >&2
+    grep -i xanmod "$APT_LOG" | tail -4 >&2
   fi
-  err "Проверь доступ к зеркалу:  curl -I https://deb.xanmod.org/dists/$CN/InRelease"
-  err "Если зеркало недоступно/задушено с этого сервера — нужна офлайн-установка .deb (напиши мне, дам пакеты)."
+  err "Репозиторий доступен, но пакет $PKG в нём не найден."
+  err "Проверь актуальные имена пакетов на https://xanmod.org/."
   exit 1
 fi
 c "Версия для установки: $PKG = $CAND"
